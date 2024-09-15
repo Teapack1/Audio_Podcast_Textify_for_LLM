@@ -1,20 +1,10 @@
-"""
-Install:
-Python 3.10
-"https://visualstudio.microsoft.com/cs/visual-cpp-build-tools/
-
-pip install Cython
-pip install youtokentome
-pip install -r requirements.txt
-pip install torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 --index-url https://download.pytorch.org/whl/cu118 --timeout 300 --retries 100
-"""
-
 import argparse
 import time
 import yt_dlp
 import os
 from diarize_class import DiarizePipeline
-from helpers import split_audio
+from helpers import (split_audio,
+                     whisper_langs)
 
 args = argparse.ArgumentParser()
 args.add_argument(
@@ -33,7 +23,7 @@ args.add_argument(
 )
 args.add_argument(
     "-max",
-    help="playlist end video no.",
+    help="At what video number do you want to stop download?",
     required=False,
     type=int,
     default=999,
@@ -47,10 +37,10 @@ args.add_argument(
 )
 args.add_argument(
     "-device",
-    help="device used for diarization",
+    help="device used for diarization (cuda or cpu)",
     required=False,
     type=str,
-    default="cuda",
+    default="cpu",
 )
 args.add_argument(
     "-mtypes",
@@ -66,6 +56,21 @@ args.add_argument(
     type=int,
     default=100,
 )
+args.add_argument(
+    "-model",
+    help="Faster Whisper model name ('medium.en')",
+    required=False,
+    type=str,
+    default="medium.en",
+)
+
+args.add_argument(
+    "--language",
+    type=str,
+    default=None,
+    choices=whisper_langs,
+    help="Language spoken in the audio, specify None to perform language detection",
+)
 
 args = args.parse_args()
 
@@ -80,6 +85,7 @@ DOWNLOAD_URL = args.url
 DOWNLOAD_START = args.min  # Start from video number
 DOWNLOAD_NUMBER = args.max  # Max number of videos to download
 EPISODES = args.episodes  # How many episodes to download and put into one output file
+WHISPER_MODEL = args.model  # "medium.en", "large-v3", "distil-large-v3"
 nth_output_file = 0  #  n.th number of output file where output will be stored
 
 retry_delay = 30  # Delay between retries in seconds
@@ -158,9 +164,7 @@ for attempt in range(1):
 
 video_info = best_attempt_info
 
-print(
-    f"    [INFO] Best attempt ({best_attempt_time+1}) \033[1mfetched \033[4m{len(video_info)} videos\033[0m from the playlist"
-)
+print(f"[INFO] Best attempt ({best_attempt_time+1}) \033[1mfetched \033[4m{len(video_info)} videos\033[0m from the playlist")
 
 video_info = video_info[DOWNLOAD_START - 1 : DOWNLOAD_NUMBER]
 print(
@@ -220,7 +224,7 @@ for number, vid in enumerate(video_info):
                 audio=audio_file_path,  # "Diarization target audio file"
                 stemming=False,  # "Disables source separation. This helps with long files that don't contain a lot of music."
                 suppress_numerals=True,  # "Suppresses Numerical Digits. This helps the diarization accuracy but converts all digits into written text.
-                model_name="medium.en",  # "name of the Whisper model to use"
+                model_name=WHISPER_MODEL,  # "name of the Whisper model to use"
                 batch_size=batch_size,  # "Batch size for batched inference, reduce if you run out of memory, set to 0 for non-batched inference"
                 language=None,  # "Language spoken in the audio, specify None to perform language detection",
                 device=device,  # "if you have a GPU use 'cuda', otherwise 'cpu'",

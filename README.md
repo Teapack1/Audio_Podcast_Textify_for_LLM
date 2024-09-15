@@ -16,9 +16,20 @@ Combines Whisper ASR capabilities with Voice Activity Detection (VAD) and Speake
 `FFMPEG` and `Cython` are needed as prerequisites to install the requirements
 
 ```bash
-pip install --use-pep517 -r requirements.txt
-pip install torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 --index-url https://download.pytorch.org/whl/cu118
+pip install cython
+pip install -r requirements.txt
 
+```
+### Linux Fresh Install:
+```bash
+sudo apt update && sudo apt upgrade
+sudo apt install cython3
+sudo apt install ffmpeg
+sudo apt install build-essential
+sudo apt install python3.10 python3.10-venv python3.10-distutils python3.10-dev
+sudo apt install software-properties-common
+sudo add-apt-repository ppa:deadsnakes/ppa
+curl -sS https://bootstrap.pypa.io/get-pip.py | sudo python3.10
 ```
 
 ## Usage

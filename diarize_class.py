@@ -2,12 +2,28 @@ import os
 import logging
 import re
 import torch
-from pydub import AudioSegment
+import torchaudio
 from nemo.collections.asr.models.msdd_models import NeuralDiarizer
 from deepmultilingualpunctuation import PunctuationModel
-from helpers import *
-from faster_whisper import WhisperModel
-import whisperx
+from helpers import (
+    cleanup,
+    create_config,
+    get_realigned_ws_mapping_with_punctuation,
+    get_sentences_speaker_mapping,
+    get_speaker_aware_transcript,
+    get_words_speaker_mapping,
+    langs_to_iso,
+    punct_model_langs,
+    write_srt,
+)
+from ctc_forced_aligner import (
+    generate_emissions,
+    get_alignments,
+    get_spans,
+    load_alignment_model,
+    postprocess_results,
+    preprocess_text,
+)
 import csv
 
 
@@ -32,8 +48,8 @@ class DiarizePipeline:
         nth_output_file=0,
     ):
 
-        # Create a new output file
-        if not os.path.exists(self.result_file_path):
+        # Create a new output file if it doesn't exist
+        if not os.path.exists(f"{self.result_file_path}/dataset_{nth_output_file}.csv"):
             with open(
                 f"{self.result_file_path}/dataset_{nth_output_file}.csv",
                 mode="w",
@@ -46,6 +62,7 @@ class DiarizePipeline:
                 )
                 writer.writeheader()
 
+        # Source Separation (Stemming)
         if stemming:
             return_code = os.system(
                 f'python3 -m demucs.separate -n htdemucs --two-stems=vocals "{audio}" -o "temp_outputs"'
@@ -65,65 +82,68 @@ class DiarizePipeline:
         else:
             vocal_target = audio
 
-        if batch_size != 0:
-            from transcription_helpers import transcribe_batched
+        # Transcription
+        from transcription_helpers import transcribe_batched
 
-            whisper_results, language = transcribe_batched(
-                vocal_target,
-                language,
-                batch_size,
-                model_name,
-                self.mtypes[device],
-                suppress_numerals,
-                device,
-                model_path,
-            )
-        else:
-            from transcription_helpers import transcribe
+        whisper_results, language, audio_waveform = transcribe_batched(
+            vocal_target,
+            language,
+            batch_size,
+            model_name,
+            self.mtypes[device],
+            suppress_numerals,
+            device,
+            model_path,
+        )
 
-            whisper_results, language = transcribe(
-                vocal_target,
-                language,
-                model_name,
-                self.mtypes[device],
-                suppress_numerals,
-                device,
-                model_path,
-            )
+        # Forced Alignment
+        alignment_model, alignment_tokenizer, alignment_dictionary = load_alignment_model(
+            device,
+            dtype=torch.float16 if device == "cuda" else torch.float32,
+        )
 
-        if language in wav2vec2_langs:
-            alignment_model, metadata = whisperx.load_align_model(
-                language_code=language, device=device
-            )
-            result_aligned = whisperx.align(
-                whisper_results, alignment_model, metadata, vocal_target, device
-            )
-            word_timestamps = filter_missing_timestamps(
-                result_aligned["word_segments"],
-                initial_timestamp=whisper_results[0].get("start"),
-                final_timestamp=whisper_results[-1].get("end"),
-            )
-            del alignment_model
-            torch.cuda.empty_cache()
-        else:
-            assert (
-                batch_size == 0
-            ), "Unsupported language, use --batch_size to 0 to generate word timestamps using whisper directly."
-            word_timestamps = []
-            for segment in whisper_results:
-                for word in segment["words"]:
-                    word_timestamps.append(
-                        {"word": word[2], "start": word[0], "end": word[1]}
-                    )
+        audio_waveform = (
+            torch.from_numpy(audio_waveform)
+            .to(alignment_model.dtype)
+            .to(alignment_model.device)
+        )
+        emissions, stride = generate_emissions(
+            alignment_model, audio_waveform, batch_size=batch_size
+        )
+
+        del alignment_model
+        torch.cuda.empty_cache()
+
+        full_transcript = "".join(segment["text"] for segment in whisper_results)
+
+        tokens_starred, text_starred = preprocess_text(
+            full_transcript,
+            romanize=True,
+            language=langs_to_iso[language],
+        )
+
+        segments, scores, blank_id = get_alignments(
+            emissions,
+            tokens_starred,
+            alignment_dictionary,
+        )
+
+        spans = get_spans(tokens_starred, segments, alignment_tokenizer.decode(blank_id))
+
+        word_timestamps = postprocess_results(text_starred, spans, stride, scores)
 
         # Convert audio to mono for NeMo compatibility
-        sound = AudioSegment.from_file(vocal_target).set_channels(1)
         ROOT = os.getcwd()
         temp_path = os.path.join(ROOT, "temp_outputs")
         os.makedirs(temp_path, exist_ok=True)
-        sound.export(os.path.join(temp_path, "mono_file.wav"), format="wav")
+        torchaudio.save(
+            os.path.join(temp_path, "mono_file.wav"),
+            audio_waveform.cpu().unsqueeze(0).float(),
+            16000,
+            channels_first=True,
+        )
 
-        # Initialize NeMo MSDD diarization model
+        # Speaker Diarization
         msdd_model = NeuralDiarizer(cfg=create_config(temp_path)).to(device)
         msdd_model.diarize()
         del msdd_model
@@ -141,10 +161,11 @@ class DiarizePipeline:
 
         wsm = get_words_speaker_mapping(word_timestamps, speaker_ts, "start")
 
+        # Punctuation Restoration
         if language in punct_model_langs:
             punct_model = PunctuationModel(model="kredor/punctuate-all")
             words_list = list(map(lambda x: x["word"], wsm))
-            labeled_words = punct_model.predict(words_list)
+            labeled_words = punct_model.predict(words_list, chunk_size=230)
 
             ending_puncts = ".?!"
             model_puncts = ".,;:!?"
@@ -166,6 +187,7 @@ class DiarizePipeline:
                 f"Punctuation restoration is not available for {language} language. Using the original punctuation."
             )
 
+        # Realign and Generate Outputs
         wsm = get_realigned_ws_mapping_with_punctuation(wsm)
         ssm = get_sentences_speaker_mapping(wsm, speaker_ts)
 
@@ -186,8 +208,7 @@ class DiarizePipeline:
         self.append_data(ssm, title, nth_output_file)
         cleanup(temp_path)
 
-        ######### Write dataset #########
-
+    # Helper method to clean titles for filenames
     def clean_title(self, title):
         replacements = {
             "<": "-",
@@ -205,6 +226,7 @@ class DiarizePipeline:
             title = title.replace(old, new)
         return title
 
+    # Method to append data to CSV
     def append_data(self, result_segments, title, nth_output_file):
         with open(
             f"{self.result_file_path}/dataset_{nth_output_file}.csv",
@@ -240,7 +262,7 @@ class DiarizePipeline:
                 # Ensure the segment has all required fields
                 if all(
                     key in segment
-                    for key in ["speaker", "text", "title", "start_time", "end_time"]
+                    for key in ["speaker", "text", "start_time", "end_time"]
                 ):
                     text_without_quotes = segment["text"].replace('"', "")
                     print(text_without_quotes)

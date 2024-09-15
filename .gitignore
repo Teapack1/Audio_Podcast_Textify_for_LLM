@@ -1,8 +1,12 @@
 __pycache__/
-Downloads/model*
+Downloads/*
+.vscode/*
+Results/*
 venv/*
 ve/*
 *.srt
 *.txt
 *.wav
 *.mp3
+*.m4a
+
